@@ -23,7 +23,7 @@ const filterProvider = getArg('--provider');
 const filterModel = getArg('--model');
 const selfTest = args.includes('--self-test');
 
-if (!outFile && !selfTest) {
+if (require.main === module && !outFile && !selfTest) {
   console.error('Usage: node scripts/verify-providers.js --out <file> [--provider <name>] [--model <id>]');
   process.exit(1);
 }
@@ -151,7 +151,7 @@ function verdict(status, bodyStr, parsed) {
 function parseCompletion(bodyStr) {
   try {
     const j = JSON.parse(bodyStr);
-    if (j.choices && Array.isArray(j.choices) && j.choices.length > 0) return j;
+    if (typeof j.choices?.[0]?.message?.content === 'string' && j.choices[0].message.content.trim()) return j;
     return null;
   } catch { return null; }
 }
@@ -159,8 +159,8 @@ function parseCompletion(bodyStr) {
 function parseCohereResponse(bodyStr) {
   try {
     const j = JSON.parse(bodyStr);
-    if (j.message && j.message.content) return j;
-    if (j.text) return j;
+    if (typeof j.message?.content === 'string' && j.message.content.trim()) return j;
+    if (Array.isArray(j.message?.content) && j.message.content.some(p => typeof p.text === 'string' && p.text.trim())) return j;
     return null;
   } catch { return null; }
 }
@@ -168,7 +168,7 @@ function parseCohereResponse(bodyStr) {
 function parseOllamaResponse(bodyStr) {
   try {
     const j = JSON.parse(bodyStr);
-    if (j.message && j.message.content) return j;
+    if (typeof j.message?.content === 'string' && j.message.content.trim()) return j;
     return null;
   } catch { return null; }
 }
@@ -293,7 +293,7 @@ function getProviderConfig(providerName, baseUrl) {
   if (name.includes('aion')) return { key: KEY.AION, type: 'standard' };
   if (name.includes('z ai') || name.includes('zhipu')) return { key: KEY.ZAI, type: 'standard' };
   if (name.includes('modelscope')) return { key: KEY.MODELSCOPE, type: 'standard' };
-  if (name.includes('kilo')) return { key: KEY.KILO, type: 'standard' };
+  if (name.includes('kilo')) return { key: KEY.KILO, type: 'standard', keyless: true };
   if (name.includes('ovhcloud') || name.includes('ovh')) return { key: KEY.OVH, type: 'standard' };
   if (name.includes('llm7')) return { key: null, type: 'standard', keyless: true };
   return { key: null, type: 'standard' };
@@ -313,7 +313,7 @@ async function callModel(providerName, baseUrl, modelId, cfg) {
   const isLlm7 = providerName.toLowerCase().includes('llm7');
 
   // No key and not a keyless/anonymous provider → SKIPPED
-  if (!key && !keyless && !isOvh && !isLlm7 && type !== 'ollama') {
+  if (!key && !keyless && !isOvh && !isLlm7) {
     return { status: 0, body: 'no key configured', _skipped: true };
   }
 
@@ -348,7 +348,7 @@ function buildRecord(providerName, modelId, status, bodyStr, cfg, startMs) {
     };
   }
 
-  if (!key && !keyless && !isOvh && !isLlm7 && type !== 'ollama') {
+  if (!key && !keyless && !isOvh && !isLlm7) {
     return {
       provider: providerName, modelId,
       verdict: 'SKIPPED', httpStatus: null, latencyMs: null,
@@ -359,7 +359,10 @@ function buildRecord(providerName, modelId, status, bodyStr, cfg, startMs) {
 
   const safeBody = redactKeys(bodyStr || '');
   let parsed = null;
-  if (type === 'cohere') parsed = parseCohereResponse(bodyStr || '');
+  if (type === 'cloudflare') {
+    try { const j = JSON.parse(bodyStr); if (j.success === true && typeof j.result?.response === 'string' && j.result.response.trim()) parsed = j; } catch {}
+  }
+  else if (type === 'cohere') parsed = parseCohereResponse(bodyStr || '');
   else if (type === 'ollama') parsed = parseOllamaResponse(bodyStr || '');
   else parsed = parseCompletion(bodyStr || '');
 
@@ -505,45 +508,29 @@ async function run() {
 // Self-test
 // ---------------------------------------------------------------------------
 async function runSelfTest() {
-  console.log('=== Self-test ===');
-
-  // 1. Test against a known-good provider (LLM7.io, keyless)
-  console.log('Self-test 1: LLM7.io keyless call with gpt-4o-mini ...');
-  const startMs = Date.now();
-  const res1 = await callStandard('https://api.llm7.io/v1', 'gpt-4o-mini', null);
-  const parsed1 = parseCompletion(res1.body || '');
-  const v1 = verdict(res1.status, res1.body || '', parsed1);
-  console.log(`  Status: ${res1.status}, Verdict: ${v1}`);
-  if (v1 !== 'PASS') {
-    console.error(`  SELF-TEST FAIL: expected PASS, got ${v1}. Body: ${redactKeys((res1.body || '').slice(0, 200))}`);
-    // LLM7 might be down — try with a different approach and mark as warning not fatal
-    console.warn('  WARNING: LLM7.io self-test did not PASS. Provider may be temporarily down.');
-    console.warn('  Proceeding with caution — harness structure verified, provider availability uncertain.');
-  } else {
-    console.log('  Self-test 1: PASS ✓');
-  }
-
-  // 2. Test with a known-invalid model ID
-  console.log('Self-test 2: LLM7.io with invalid model ID ...');
-  const res2 = await callStandard('https://api.llm7.io/v1', 'this-model-definitely-does-not-exist-xyz', null);
-  const cls2 = classify(res2.status, res2.body || '');
-  console.log(`  Status: ${res2.status}, Class: ${cls2}, Body snippet: ${(res2.body || '').slice(0, 150)}`);
-  if (cls2 !== 'NOT_FOUND' && res2.status !== 200) {
-    console.warn(`  Self-test 2: got class ${cls2} (status ${res2.status}) — acceptable for provider behavior`);
-  } else if (res2.status === 200) {
-    console.warn('  Self-test 2: provider returned 200 for invalid model — unusual but not fatal');
-  } else {
-    console.log('  Self-test 2: PASS ✓');
-  }
-
-  console.log('=== Self-test complete ===\n');
+  const assert = require('node:assert/strict');
+  assert.equal(classify(401, ''), 'AUTH');
+  assert.equal(classify(429, ''), 'RATE_LIMIT');
+  assert.equal(classify(402, ''), 'BILLING');
+  assert.equal(classify(0, ''), 'NETWORK');
+  assert.equal(parseCompletion('{"choices": [{}]}'), null);
+  assert.equal(verdict(200, '{}', null), 'UNKNOWN');
+  assert.ok(parseCompletion('{"choices":[{"message":{"content":"OK"}}]}'));
+  assert.ok(parseCohereResponse('{"message":{"content":[{"text":"OK"}]}}'));
+  assert.equal(parseCohereResponse('{"message":{"content":[]}}'), null);
+  assert.ok(parseOllamaResponse('{"message":{"content":"OK"}}'));
+  const cf = buildRecord('Cloudflare Workers AI', 'test', 200,
+    '{"success":true,"result":{"response":"OK"}}', {type:'cloudflare',key:'test'}, Date.now());
+  assert.equal(cf.verdict, 'PASS');
+  assert.equal(getProviderConfig('Kilo Code').keyless, true);
+  console.log('Offline self-test: 12 assertions passed; no external requests.');
   return true;
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
-(async () => {
+if (require.main === module) (async () => {
   try {
     if (selfTest) {
       await runSelfTest();
